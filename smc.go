@@ -17,7 +17,7 @@ import (
 	"unsafe"
 )
 
-// ReadTemperature returns the current temperature in fahrenheit
+// ReadTemperature returns the current temperature in celsius
 func ReadTemperature() float64 {
 	openMutex.Lock()
 	if !open {
