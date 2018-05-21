@@ -33,7 +33,7 @@ func ReadTemperature() float64 {
 	return temp
 }
 
-// ReadFanSpeeds returns the current fan speeds
+// ReadFanSpeeds returns the current fan speeds as rpm
 func ReadFanSpeeds() []int {
 	openMutex.Lock()
 	if !open {
