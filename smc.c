@@ -139,19 +139,16 @@ int SMCReadKey(UInt32Char_t key, SMCVal_t *val) {
 }
 
 double SMCGetTemperature(char *key) {
-    printf("key: %s\n", key);
     SMCVal_t val;
     int result;
 
     result = SMCReadKey(key, &val);
-    printf("result: %d\n", result);
     if (result == kIOReturnSuccess) {
         // read succeeded - check returned value
         if (val.dataSize > 0) {
             if (strcmp(val.dataType, DATATYPE_SP78) == 0) {
                 // convert sp78 value to temperature
                 int intValue = val.bytes[0] * 256 + (unsigned char)val.bytes[1];
-                printf("int val: %d\n", intValue);
                 return intValue / 256.0;
             }
         }
