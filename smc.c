@@ -15,13 +15,17 @@
  *
  *   2. beltex/SMCKit (MIT, Swift), which establishes the standard
  *      shape of a clean SMC reader: SMCOpen/SMCClose + a single
- *      two-step readKey helper that decodes sp78 (temperature) and
- *      fpe2 (fan RPM) fixed-point formats.
+ *      two-step readKey helper.
  *      https://github.com/beltex/SMCKit
  *
  * Struct layouts and the SMC ioctl indices reproduced here are
  * IOKit ABI facts and are not copyrightable expression. Released
  * under the MIT license — see LICENSE.
+ *
+ * Design note: this file only marshals the kernel call and returns
+ * the raw key bytes + 4-byte type code to Go. All format decoding
+ * (sp78, fpe2, flt, …) lives in smc.go where it's easier to test
+ * and extend without touching cgo.
  */
 
 #include <stdint.h>
@@ -32,9 +36,9 @@
 
 /* AppleSMC user-client selector + command codes (IOKit ABI). */
 enum {
-    kSMCUserClientIndex   = 2,
-    kSMCCmdReadBytes      = 5,
-    kSMCCmdReadKeyInfo    = 9,
+    kSMCUserClientIndex = 2,
+    kSMCCmdReadBytes    = 5,
+    kSMCCmdReadKeyInfo  = 9,
 };
 
 static io_connect_t gConn;
@@ -74,60 +78,44 @@ int SMCClose(void) {
     return IOServiceClose(gConn);
 }
 
-/*
- * readKey performs the two-call SMC read protocol: ask for the key's
- * metadata (size + type), then ask for that many bytes. On success,
- * `out` holds the response from the second call (bytes[] is valid).
- */
-static int readKey(const char *key, SMCKeyData_t *out) {
-    SMCKeyData_t in;
-    memset(&in, 0, sizeof(in));
-    memset(out, 0, sizeof(*out));
+int SMCRead(const char *key, char type[4], uint32_t *size, uint8_t data[32]) {
+    *size = 0;
+    memset(data, 0, 32);
+    memset(type, 0, 4);
+
+    SMCKeyData_t in, out;
+    memset(&in,  0, sizeof(in));
+    memset(&out, 0, sizeof(out));
     in.key   = packKey(key);
     in.data8 = kSMCCmdReadKeyInfo;
 
-    size_t outSize = sizeof(*out);
+    size_t outSize = sizeof(out);
     if (IOConnectCallStructMethod(gConn, kSMCUserClientIndex,
                                   &in, sizeof(in),
-                                  out, &outSize) != kIOReturnSuccess) {
+                                  &out, &outSize) != kIOReturnSuccess) {
+        return -1;
+    }
+    uint32_t dsz = out.keyInfo.dataSize;
+    uint32_t dty = out.keyInfo.dataType;
+    if (dsz == 0 || dsz > 32) {
         return -1;
     }
 
-    in.keyInfo.dataSize = out->keyInfo.dataSize;
+    in.keyInfo.dataSize = dsz;
     in.data8            = kSMCCmdReadBytes;
-    outSize             = sizeof(*out);
+    outSize             = sizeof(out);
+    memset(&out, 0, sizeof(out));
     if (IOConnectCallStructMethod(gConn, kSMCUserClientIndex,
                                   &in, sizeof(in),
-                                  out, &outSize) != kIOReturnSuccess) {
+                                  &out, &outSize) != kIOReturnSuccess) {
         return -1;
     }
+
+    type[0] = (dty >> 24) & 0xff;
+    type[1] = (dty >> 16) & 0xff;
+    type[2] = (dty >>  8) & 0xff;
+    type[3] = (dty      ) & 0xff;
+    *size   = dsz;
+    memcpy(data, out.bytes, dsz);
     return 0;
-}
-
-/*
- * sp78 is Apple's signed 8.8 fixed-point format used for temperature
- * keys (e.g. TC0P, "CPU 0 proximity"): high byte = signed integer
- * part, low byte = fractional part / 256.
- */
-double SMCGetTemperature(char *key) {
-    SMCKeyData_t r;
-    if (readKey(key, &r) != 0) {
-        return 0.0;
-    }
-    int16_t raw = (int16_t)(((uint16_t)r.bytes[0] << 8) | (uint16_t)r.bytes[1]);
-    return raw / 256.0;
-}
-
-/*
- * fpe2 is Apple's unsigned 14.2 fixed-point format used for fan
- * keys (e.g. F0Ac, "fan 0 actual"): 14-bit integer RPM in the high
- * bits, 2 fractional bits in the low — divide the raw u16 by 4.
- */
-double SMCGetFanSpeed(char *key) {
-    SMCKeyData_t r;
-    if (readKey(key, &r) != 0) {
-        return 0.0;
-    }
-    uint16_t raw = ((uint16_t)r.bytes[0] << 8) | (uint16_t)r.bytes[1];
-    return raw / 4.0;
 }
