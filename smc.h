@@ -53,9 +53,18 @@ typedef struct {
     uint8_t       bytes[32];
 } SMCKeyData_t;
 
-int    SMCOpen(void);
-int    SMCClose(void);
-double SMCGetTemperature(char *key);
-double SMCGetFanSpeed(char *key);
+int SMCOpen(void);
+int SMCClose(void);
+
+/*
+ * SMCRead performs the two-call AppleSMC read protocol for `key`
+ * (a 4-character string, e.g. "TC0P" / "F0Ac" / "Tp01"). On success
+ * it returns 0 and fills:
+ *   type[4]    — the SMC data type as ASCII (e.g. "sp78", "fpe2", "flt ")
+ *   *size      — the number of valid bytes in data[]
+ *   data[32]   — the raw key bytes; caller decodes based on `type`.
+ * On failure returns non-zero; *size and data[] are zeroed.
+ */
+int SMCRead(const char *key, char type[4], uint32_t *size, uint8_t data[32]);
 
 #endif /* GO_SMC_H */
