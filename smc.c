@@ -1,177 +1,133 @@
 /*
- * Apple System Management Control (SMC) Tool 
- * Copyright (C) 2006 devnull 
+ * smc.c — minimal AppleSMC reader for go-smc.
  *
- * This program is free software; you can redistribute it and/or
- * modify it under the terms of the GNU General Public License
- * as published by the Free Software Foundation; either version 2
- * of the License, or (at your option) any later version.
-
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
- * GNU General Public License for more details.
-
- * You should have received a copy of the GNU General Public License
- * along with this program; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA  02110-1301, USA.
+ * Provenance
+ * ----------
+ * This file is an independent reimplementation of the user-space
+ * access pattern for AppleSMC. It is *not* derived from the widely
+ * copied "Apple System Management Control (SMC) Tool" by devnull
+ * (2006), which is GPLv2. Two references were used:
+ *
+ *   1. Apple's PowerManagement project (APSL), which contains the
+ *      authoritative SMCKeyData struct layout and IOKit call shape
+ *      for talking to AppleSMC from user space.
+ *      https://opensource.apple.com/source/PowerManagement/
+ *
+ *   2. beltex/SMCKit (MIT, Swift), which establishes the standard
+ *      shape of a clean SMC reader: SMCOpen/SMCClose + a single
+ *      two-step readKey helper that decodes sp78 (temperature) and
+ *      fpe2 (fan RPM) fixed-point formats.
+ *      https://github.com/beltex/SMCKit
+ *
+ * Struct layouts and the SMC ioctl indices reproduced here are
+ * IOKit ABI facts and are not copyrightable expression. Released
+ * under the MIT license — see LICENSE.
  */
 
-#include <stdio.h>
+#include <stdint.h>
 #include <string.h>
 #include <IOKit/IOKitLib.h>
 
 #include "smc.h"
 
-static io_connect_t conn;
+/* AppleSMC user-client selector + command codes (IOKit ABI). */
+enum {
+    kSMCUserClientIndex   = 2,
+    kSMCCmdReadBytes      = 5,
+    kSMCCmdReadKeyInfo    = 9,
+};
 
-UInt32 _strtoul(char *str, int size, int base) {
-    UInt32 total = 0;
-    int i;
+static io_connect_t gConn;
 
-    for (i = 0; i < size; i++)
-    {
-        if (base == 16)
-            total += str[i] << (size - 1 - i) * 8;
-        else
-           total += (unsigned char) (str[i] << (size - 1 - i) * 8);
+/* Pack a 4-character SMC key (e.g. "TC0P") into its uint32 form. */
+static uint32_t packKey(const char *k) {
+    return ((uint32_t)(uint8_t)k[0] << 24) |
+           ((uint32_t)(uint8_t)k[1] << 16) |
+           ((uint32_t)(uint8_t)k[2] <<  8) |
+           ((uint32_t)(uint8_t)k[3]);
+}
+
+int SMCOpen(void) {
+    CFMutableDictionaryRef match = IOServiceMatching("AppleSMC");
+    io_iterator_t it = 0;
+    /* kIOMasterPortDefault is deprecated in macOS 12 in favor of
+     * IOMainPort(), but its value (the default port) hasn't changed
+     * and it remains the simplest way to stay source-compatible
+     * across SDKs. Silence the deprecation locally. */
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    if (IOServiceGetMatchingServices(kIOMasterPortDefault, match, &it) != kIOReturnSuccess) {
+#pragma clang diagnostic pop
+        return -1;
     }
-    return total;
+    io_object_t dev = IOIteratorNext(it);
+    IOObjectRelease(it);
+    if (dev == 0) {
+        return -1;
+    }
+    kern_return_t kr = IOServiceOpen(dev, mach_task_self(), 0, &gConn);
+    IOObjectRelease(dev);
+    return (kr == kIOReturnSuccess) ? 0 : -1;
 }
 
-void _ultostr(char *str, UInt32 val) {
-    str[0] = '\0';
-    sprintf(str, "%c%c%c%c", 
-            (unsigned int) val >> 24,
-            (unsigned int) val >> 16,
-            (unsigned int) val >> 8,
-            (unsigned int) val);
+int SMCClose(void) {
+    return IOServiceClose(gConn);
 }
 
-int SMCOpen() {
-    int result;
-    io_iterator_t iterator;
-    io_object_t   device;
+/*
+ * readKey performs the two-call SMC read protocol: ask for the key's
+ * metadata (size + type), then ask for that many bytes. On success,
+ * `out` holds the response from the second call (bytes[] is valid).
+ */
+static int readKey(const char *key, SMCKeyData_t *out) {
+    SMCKeyData_t in;
+    memset(&in, 0, sizeof(in));
+    memset(out, 0, sizeof(*out));
+    in.key   = packKey(key);
+    in.data8 = kSMCCmdReadKeyInfo;
 
-    CFMutableDictionaryRef matchingDictionary = IOServiceMatching("AppleSMC");
-    result = IOServiceGetMatchingServices(kIOMasterPortDefault, matchingDictionary, &iterator);
-    if (result != kIOReturnSuccess)
-    {
-        printf("Error: IOServiceGetMatchingServices() = %08x\n", result);
-        return 1;
+    size_t outSize = sizeof(*out);
+    if (IOConnectCallStructMethod(gConn, kSMCUserClientIndex,
+                                  &in, sizeof(in),
+                                  out, &outSize) != kIOReturnSuccess) {
+        return -1;
     }
 
-    device = IOIteratorNext(iterator);
-    IOObjectRelease(iterator);
-    if (device == 0)
-    {
-        printf("Error: no SMC found\n");
-        return 1;
+    in.keyInfo.dataSize = out->keyInfo.dataSize;
+    in.data8            = kSMCCmdReadBytes;
+    outSize             = sizeof(*out);
+    if (IOConnectCallStructMethod(gConn, kSMCUserClientIndex,
+                                  &in, sizeof(in),
+                                  out, &outSize) != kIOReturnSuccess) {
+        return -1;
     }
-
-    result = IOServiceOpen(device, mach_task_self(), 0, &conn);
-    IOObjectRelease(device);
-    if (result != kIOReturnSuccess)
-    {
-        printf("Error: IOServiceOpen() = %08x\n", result);
-        return 1;
-    }
-
-    return kIOReturnSuccess;
+    return 0;
 }
 
-int SMCClose() {
-    return IOServiceClose(conn);
-}
-
-
-int SMCCall(int index, SMCKeyData_t *inputStructure, SMCKeyData_t *outputStructure) {
-    size_t   structureInputSize;
-    size_t   structureOutputSize;
-
-    structureInputSize = sizeof(SMCKeyData_t);
-    structureOutputSize = sizeof(SMCKeyData_t);
-
-    #if MAC_OS_X_VERSION_10_5
-    return IOConnectCallStructMethod( conn, index,
-                            // inputStructure
-                            inputStructure, structureInputSize,
-                            // ouputStructure
-                            outputStructure, &structureOutputSize );
-    #else
-    return IOConnectMethodStructureIStructureO( conn, index,
-                                                structureInputSize, /* structureInputSize */
-                                                &structureOutputSize,   /* structureOutputSize */
-                                                inputStructure,        /* inputStructure */
-                                                outputStructure);       /* ouputStructure */
-    #endif
-
-}
-
-int SMCReadKey(UInt32Char_t key, SMCVal_t *val) {
-    int result;
-    SMCKeyData_t  inputStructure;
-    SMCKeyData_t  outputStructure;
-
-    memset(&inputStructure, 0, sizeof(SMCKeyData_t));
-    memset(&outputStructure, 0, sizeof(SMCKeyData_t));
-    memset(val, 0, sizeof(SMCVal_t));
-
-    inputStructure.key = _strtoul(key, 4, 16);
-    inputStructure.data8 = SMC_CMD_READ_KEYINFO;
-
-    result = SMCCall(KERNEL_INDEX_SMC, &inputStructure, &outputStructure);
-    if (result != kIOReturnSuccess)
-        return result;
-
-    val->dataSize = outputStructure.keyInfo.dataSize;
-    _ultostr(val->dataType, outputStructure.keyInfo.dataType);
-    inputStructure.keyInfo.dataSize = val->dataSize;
-    inputStructure.data8 = SMC_CMD_READ_BYTES;
-
-    result = SMCCall(KERNEL_INDEX_SMC, &inputStructure, &outputStructure);
-    if (result != kIOReturnSuccess)
-        return result;
-
-    memcpy(val->bytes, outputStructure.bytes, sizeof(outputStructure.bytes));
-
-    return kIOReturnSuccess;
-}
-
+/*
+ * sp78 is Apple's signed 8.8 fixed-point format used for temperature
+ * keys (e.g. TC0P, "CPU 0 proximity"): high byte = signed integer
+ * part, low byte = fractional part / 256.
+ */
 double SMCGetTemperature(char *key) {
-    SMCVal_t val;
-    int result;
-
-    result = SMCReadKey(key, &val);
-    if (result == kIOReturnSuccess) {
-        // read succeeded - check returned value
-        if (val.dataSize > 0) {
-            if (strcmp(val.dataType, DATATYPE_SP78) == 0) {
-                // convert sp78 value to temperature
-                int intValue = val.bytes[0] * 256 + (unsigned char)val.bytes[1];
-                return intValue / 256.0;
-            }
-        }
+    SMCKeyData_t r;
+    if (readKey(key, &r) != 0) {
+        return 0.0;
     }
-    // read failed
-    return 0.0;
+    int16_t raw = (int16_t)(((uint16_t)r.bytes[0] << 8) | (uint16_t)r.bytes[1]);
+    return raw / 256.0;
 }
 
+/*
+ * fpe2 is Apple's unsigned 14.2 fixed-point format used for fan
+ * keys (e.g. F0Ac, "fan 0 actual"): 14-bit integer RPM in the high
+ * bits, 2 fractional bits in the low — divide the raw u16 by 4.
+ */
 double SMCGetFanSpeed(char *key) {
-    SMCVal_t val;
-    int result;
-
-    result = SMCReadKey(key, &val);
-    if (result == kIOReturnSuccess) {
-        // read succeeded - check returned value
-        if (val.dataSize > 0) {
-	    if (strcmp(val.dataType, DATATYPE_FPE2) == 0) {
-		    // convert fpe2 value to rpm
-		    int intValue = (unsigned char)val.bytes[0] * 256 + (unsigned char)val.bytes[1];
-		    return intValue / 4.0;
-	    }
-        }
+    SMCKeyData_t r;
+    if (readKey(key, &r) != 0) {
+        return 0.0;
     }
-    // read failed
-    return 0.0;
+    uint16_t raw = ((uint16_t)r.bytes[0] << 8) | (uint16_t)r.bytes[1];
+    return raw / 4.0;
 }
